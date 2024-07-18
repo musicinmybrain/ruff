@@ -102,16 +102,8 @@ pub(crate) fn file_to_module(db: &dyn Db, file: File) -> Option<Module> {
 ///
 /// This method also implements the typing spec's [module resolution order].
 ///
-/// TODO(Alex): this method does multiple `.unwrap()` calls when it should really return an error.
-/// Each `.unwrap()` call is a point where we're validating a setting that the user would pass
-/// and transforming it into an internal representation for a validated path.
-/// Rather than panicking if a path fails to validate, we should display an error message to the user
-/// and exit the process with a nonzero exit code.
-/// This validation should probably be done outside of Salsa?
-///
 /// [module resolution order]: https://typing.readthedocs.io/en/latest/spec/distributing.html#import-resolution-ordering
-#[salsa::tracked(return_ref)]
-pub(crate) fn resolve_module_resolution_settings(
+fn try_resolve_module_resolution_settings(
     db: &dyn Db,
 ) -> Result<ModuleResolutionSettings, SearchPathValidationError> {
     let program = Program::get(db.upcast());
@@ -185,9 +177,11 @@ pub(crate) fn resolve_module_resolution_settings(
     })
 }
 
-fn module_resolution_settings(db: &dyn Db) -> &ModuleResolutionSettings {
-    // TODO proper error handling if this Salsa query returns an error:
-    resolve_module_resolution_settings(db).as_ref().unwrap()
+#[salsa::tracked(return_ref)]
+pub(crate) fn module_resolution_settings(db: &dyn Db) -> ModuleResolutionSettings {
+    // TODO proper error handling if this Salsa query returns an error
+    // rather than panicking if a path fails to validate
+    try_resolve_module_resolution_settings(db).unwrap()
 }
 
 /// Collect all dynamic search paths:
