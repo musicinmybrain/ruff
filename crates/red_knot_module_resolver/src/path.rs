@@ -4,6 +4,8 @@
 //! <https://github.com/astral-sh/ruff/pull/12141#discussion_r1667010245>
 
 use std::fmt;
+use std::ops::Deref;
+use std::sync::Arc;
 
 use ruff_db::files::{system_path_to_file, vendored_path_to_file, File, FilePath};
 use ruff_db::system::{System, SystemPath, SystemPathBuf};
@@ -12,7 +14,7 @@ use ruff_db::vendored::{VendoredPath, VendoredPathBuf};
 use crate::db::Db;
 use crate::module_name::ModuleName;
 use crate::state::ResolverState;
-use crate::typeshed::TypeshedVersionsQueryResult;
+use crate::typeshed::{TypeshedVersionsParseError, TypeshedVersionsQueryResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum FilePathRef<'a> {
@@ -167,60 +169,28 @@ impl ModuleResolutionPathBuf {
     }
 
     #[must_use]
-    pub(crate) fn extra(path: impl Into<SystemPathBuf>) -> Option<Self> {
-        let path = path.into();
-        path.extension()
-            .map_or(true, |ext| matches!(ext, "py" | "pyi"))
-            .then_some(Self(ModuleResolutionPathBufInner::Extra(path)))
+    fn extra(path: impl Into<SystemPathBuf>) -> Self {
+        Self(ModuleResolutionPathBufInner::Extra(path.into()))
     }
 
     #[must_use]
-    pub(crate) fn first_party(path: impl Into<SystemPathBuf>) -> Option<Self> {
-        let path = path.into();
-        path.extension()
-            .map_or(true, |ext| matches!(ext, "pyi" | "py"))
-            .then_some(Self(ModuleResolutionPathBufInner::FirstParty(path)))
+    fn first_party(path: impl Into<SystemPathBuf>) -> Self {
+        Self(ModuleResolutionPathBufInner::FirstParty(path.into()))
     }
 
     #[must_use]
-    pub(crate) fn standard_library(path: FilePath) -> Option<Self> {
-        path.extension()
-            .map_or(true, |ext| ext == "pyi")
-            .then_some(Self(ModuleResolutionPathBufInner::StandardLibrary(path)))
+    fn standard_library(path: FilePath) -> Self {
+        Self(ModuleResolutionPathBufInner::StandardLibrary(path))
     }
 
     #[must_use]
-    pub(crate) fn stdlib_from_custom_typeshed_root(typeshed_root: &SystemPath) -> Option<Self> {
-        Self::standard_library(FilePath::System(
-            typeshed_root.join(SystemPath::new("stdlib")),
-        ))
+    pub(crate) fn site_packages(path: impl Into<SystemPathBuf>) -> Self {
+        Self(ModuleResolutionPathBufInner::SitePackages(path.into()))
     }
 
     #[must_use]
-    pub(crate) fn vendored_stdlib() -> Self {
-        Self(ModuleResolutionPathBufInner::StandardLibrary(
-            FilePath::Vendored(VendoredPathBuf::from("stdlib")),
-        ))
-    }
-
-    #[must_use]
-    pub(crate) fn site_packages(path: impl Into<SystemPathBuf>) -> Option<Self> {
-        let path = path.into();
-        path.extension()
-            .map_or(true, |ext| matches!(ext, "pyi" | "py"))
-            .then_some(Self(ModuleResolutionPathBufInner::SitePackages(path)))
-    }
-
-    #[must_use]
-    pub(crate) fn editable_installation_root(
-        system: &dyn System,
-        path: impl Into<SystemPathBuf>,
-    ) -> Option<Self> {
-        let path = path.into();
-        // TODO: Add Salsa invalidation to this system call:
-        system
-            .is_directory(&path)
-            .then_some(Self(ModuleResolutionPathBufInner::EditableInstall(path)))
+    pub(crate) fn editable(path: impl Into<SystemPathBuf>) -> Self {
+        Self(ModuleResolutionPathBufInner::EditableInstall(path.into()))
     }
 
     #[must_use]
@@ -305,6 +275,18 @@ impl PartialEq<SystemPathBuf> for ModuleResolutionPathBuf {
 }
 
 impl PartialEq<ModuleResolutionPathBuf> for SystemPathBuf {
+    fn eq(&self, other: &ModuleResolutionPathBuf) -> bool {
+        other.eq(self)
+    }
+}
+
+impl PartialEq<VendoredPathBuf> for ModuleResolutionPathBuf {
+    fn eq(&self, other: &VendoredPathBuf) -> bool {
+        ModuleResolutionPathRef::from(self) == **other
+    }
+}
+
+impl PartialEq<ModuleResolutionPathBuf> for VendoredPathBuf {
     fn eq(&self, other: &ModuleResolutionPathBuf) -> bool {
         other.eq(self)
     }
@@ -725,6 +707,169 @@ impl PartialEq<ModuleResolutionPathRef<'_>> for VendoredPathBuf {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum SearchPathValidationError {
+    NotADirectory(SystemPathBuf),
+    NoStdlibSubdirectory(SystemPathBuf),
+    NoVersionsFile(SystemPathBuf),
+    VersionsParseError(TypeshedVersionsParseError),
+}
+
+impl fmt::Display for SearchPathValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotADirectory(path) => write!(f, "{path} does not point to a directory"),
+            Self::NoStdlibSubdirectory(path) => {
+                write!(f, "The directory at {path} has no `stdlib/` subdirectory")
+            }
+            Self::NoVersionsFile(path) => write!(f, "Expected a file at {path}/stldib/VERSIONS"),
+            Self::VersionsParseError(underlying_error) => underlying_error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for SearchPathValidationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        if let Self::VersionsParseError(underlying_error) = self {
+            Some(underlying_error)
+        } else {
+            None
+        }
+    }
+}
+
+type SearchPathResult = Result<ModuleSearchPath, SearchPathValidationError>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ModuleSearchPath(Arc<ModuleResolutionPathBuf>);
+
+impl ModuleSearchPath {
+    pub(crate) fn extra(system: &dyn System, root: impl Into<SystemPathBuf>) -> SearchPathResult {
+        let root = root.into();
+        if system.is_directory(&root) {
+            Ok(Self(Arc::new(ModuleResolutionPathBuf::extra(
+                SystemPath::absolute(root, system.current_directory()),
+            ))))
+        } else {
+            Err(SearchPathValidationError::NotADirectory(root))
+        }
+    }
+
+    pub(crate) fn first_party(
+        system: &dyn System,
+        root: impl Into<SystemPathBuf>,
+    ) -> SearchPathResult {
+        let root = root.into();
+        if system.is_directory(&root) {
+            Ok(Self(Arc::new(ModuleResolutionPathBuf::first_party(
+                SystemPath::absolute(root, system.current_directory()),
+            ))))
+        } else {
+            Err(SearchPathValidationError::NotADirectory(root))
+        }
+    }
+
+    pub(crate) fn custom_stdlib(
+        db: &dyn Db,
+        typeshed: impl Into<SystemPathBuf>,
+    ) -> SearchPathResult {
+        let typeshed = typeshed.into();
+        let system = db.system();
+        if !system.is_directory(&typeshed) {
+            return Err(SearchPathValidationError::NotADirectory(typeshed));
+        }
+        let stdlib = typeshed.join("stdlib");
+        if !system.is_directory(&stdlib) {
+            return Err(SearchPathValidationError::NoStdlibSubdirectory(typeshed));
+        }
+        let Some(typeshed_versions) = system_path_to_file(db.upcast(), stdlib.join("VERSIONS"))
+        else {
+            return Err(SearchPathValidationError::NoVersionsFile(typeshed));
+        };
+        crate::typeshed::parse_typeshed_versions(db, typeshed_versions)
+            .as_ref()
+            .map_err(|validation_error| {
+                SearchPathValidationError::VersionsParseError(validation_error.clone())
+            })?;
+        Ok(Self(Arc::new(ModuleResolutionPathBuf::standard_library(
+            FilePath::System(SystemPath::absolute(stdlib, system.current_directory())),
+        ))))
+    }
+
+    pub(crate) fn vendored_stdlib() -> Self {
+        Self(Arc::new(ModuleResolutionPathBuf::standard_library(
+            FilePath::Vendored(VendoredPathBuf::from("stdlib")),
+        )))
+    }
+
+    pub(crate) fn site_packages(
+        system: &dyn System,
+        root: impl Into<SystemPathBuf>,
+    ) -> SearchPathResult {
+        let root = root.into();
+        if system.is_directory(&root) {
+            Ok(Self(Arc::new(ModuleResolutionPathBuf::site_packages(
+                SystemPath::absolute(root, system.current_directory()),
+            ))))
+        } else {
+            Err(SearchPathValidationError::NotADirectory(root))
+        }
+    }
+
+    pub(crate) fn editable(
+        system: &dyn System,
+        root: impl Into<SystemPathBuf>,
+    ) -> SearchPathResult {
+        let root = root.into();
+        if system.is_directory(&root) {
+            Ok(Self(Arc::new(ModuleResolutionPathBuf::editable(
+                SystemPath::absolute(root, system.current_directory()),
+            ))))
+        } else {
+            Err(SearchPathValidationError::NotADirectory(root))
+        }
+    }
+
+    pub(crate) fn as_module_path(&self) -> &ModuleResolutionPathBuf {
+        &self.0
+    }
+}
+
+impl PartialEq<SystemPathBuf> for ModuleSearchPath {
+    fn eq(&self, other: &SystemPathBuf) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl PartialEq<ModuleSearchPath> for SystemPathBuf {
+    fn eq(&self, other: &ModuleSearchPath) -> bool {
+        other.eq(self)
+    }
+}
+
+impl PartialEq<VendoredPathBuf> for ModuleSearchPath {
+    fn eq(&self, other: &VendoredPathBuf) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl PartialEq<ModuleSearchPath> for VendoredPathBuf {
+    fn eq(&self, other: &ModuleSearchPath) -> bool {
+        other.eq(self)
+    }
+}
+
+// TODO: this is unprincipled.
+// We should instead just implement the methods we need on ModuleSearchPath,
+// and adjust the signatures/implementations of methods that receive ModuleSearchPaths.
+impl Deref for ModuleSearchPath {
+    type Target = ModuleResolutionPathBuf;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use insta::assert_debug_snapshot;
@@ -787,29 +932,19 @@ mod tests {
             };
             ModuleResolutionPathBuf(inner)
         }
-
-        #[must_use]
-        pub(crate) const fn is_stdlib_search_path(&self) -> bool {
-            matches!(&self.0, ModuleResolutionPathRefInner::StandardLibrary(_))
-        }
     }
 
-    #[test]
-    fn constructor_rejects_non_pyi_stdlib_paths() {
-        assert_eq!(
-            ModuleResolutionPathBuf::standard_library(FilePath::system("foo.py")),
-            None
-        );
-        assert_eq!(
-            ModuleResolutionPathBuf::standard_library(FilePath::system("foo/__init__.py")),
-            None
-        );
+    impl ModuleSearchPath {
+        #[must_use]
+        pub(crate) fn is_stdlib_search_path(&self) -> bool {
+            matches!(&self.0 .0, ModuleResolutionPathBufInner::StandardLibrary(_))
+        }
     }
 
     #[test]
     fn path_buf_debug_impl() {
         assert_debug_snapshot!(
-            ModuleResolutionPathBuf::standard_library(FilePath::system("foo/bar.pyi")).unwrap(),
+            ModuleResolutionPathBuf::standard_library(FilePath::system("foo/bar.pyi")),
             @r###"
         ModuleResolutionPathBuf::StandardLibrary(
             System(
@@ -835,16 +970,12 @@ mod tests {
     #[test]
     fn with_extension_methods() {
         assert_eq!(
-            ModuleResolutionPathBuf::standard_library(FilePath::system("foo"))
-                .unwrap()
-                .with_py_extension(),
+            ModuleResolutionPathBuf::standard_library(FilePath::system("foo")).with_py_extension(),
             None
         );
 
         assert_eq!(
-            ModuleResolutionPathBuf::standard_library(FilePath::system("foo"))
-                .unwrap()
-                .with_pyi_extension(),
+            ModuleResolutionPathBuf::standard_library(FilePath::system("foo")).with_pyi_extension(),
             ModuleResolutionPathBuf(ModuleResolutionPathBufInner::StandardLibrary(
                 FilePath::System(SystemPathBuf::from("foo.pyi"))
             ))
@@ -852,7 +983,6 @@ mod tests {
 
         assert_eq!(
             ModuleResolutionPathBuf::first_party("foo/bar")
-                .unwrap()
                 .with_py_extension()
                 .unwrap(),
             ModuleResolutionPathBuf(ModuleResolutionPathBufInner::FirstParty(
@@ -935,25 +1065,19 @@ mod tests {
     #[test]
     fn join() {
         assert_eq!(
-            ModuleResolutionPathBuf::standard_library(FilePath::system("foo"))
-                .unwrap()
-                .join("bar"),
+            ModuleResolutionPathBuf::standard_library(FilePath::system("foo")).join("bar"),
             ModuleResolutionPathBuf(ModuleResolutionPathBufInner::StandardLibrary(
                 FilePath::system("foo/bar")
             ))
         );
         assert_eq!(
-            ModuleResolutionPathBuf::standard_library(FilePath::system("foo"))
-                .unwrap()
-                .join("bar.pyi"),
+            ModuleResolutionPathBuf::standard_library(FilePath::system("foo")).join("bar.pyi"),
             ModuleResolutionPathBuf(ModuleResolutionPathBufInner::StandardLibrary(
                 FilePath::system("foo/bar.pyi")
             ))
         );
         assert_eq!(
-            ModuleResolutionPathBuf::extra("foo")
-                .unwrap()
-                .join("bar.py"),
+            ModuleResolutionPathBuf::extra("foo").join("bar.py"),
             ModuleResolutionPathBuf(ModuleResolutionPathBufInner::Extra(SystemPathBuf::from(
                 "foo/bar.py"
             )))
@@ -963,39 +1087,30 @@ mod tests {
     #[test]
     #[should_panic(expected = "Extension must be `pyi`; got `py`")]
     fn stdlib_path_invalid_join_py() {
-        ModuleResolutionPathBuf::standard_library(FilePath::system("foo"))
-            .unwrap()
-            .push("bar.py");
+        ModuleResolutionPathBuf::standard_library(FilePath::system("foo")).push("bar.py");
     }
 
     #[test]
     #[should_panic(expected = "Extension must be `pyi`; got `rs`")]
     fn stdlib_path_invalid_join_rs() {
-        ModuleResolutionPathBuf::standard_library(FilePath::system("foo"))
-            .unwrap()
-            .push("bar.rs");
+        ModuleResolutionPathBuf::standard_library(FilePath::system("foo")).push("bar.rs");
     }
 
     #[test]
     #[should_panic(expected = "Extension must be `py` or `pyi`; got `rs`")]
     fn non_stdlib_path_invalid_join_rs() {
-        ModuleResolutionPathBuf::site_packages("foo")
-            .unwrap()
-            .push("bar.rs");
+        ModuleResolutionPathBuf::site_packages("foo").push("bar.rs");
     }
 
     #[test]
     #[should_panic(expected = "already has an extension")]
     fn invalid_stdlib_join_too_many_extensions() {
-        ModuleResolutionPathBuf::standard_library(FilePath::system("foo.pyi"))
-            .unwrap()
-            .push("bar.pyi");
+        ModuleResolutionPathBuf::standard_library(FilePath::system("foo.pyi")).push("bar.pyi");
     }
 
     #[test]
     fn relativize_stdlib_path_errors() {
-        let root =
-            ModuleResolutionPathBuf::standard_library(FilePath::system("foo/stdlib")).unwrap();
+        let root = ModuleResolutionPathBuf::standard_library(FilePath::system("foo/stdlib"));
 
         // Must have a `.pyi` extension or no extension:
         let bad_absolute_path = FilePath::system("foo/stdlib/x.py");
@@ -1010,7 +1125,7 @@ mod tests {
 
     #[test]
     fn relativize_non_stdlib_path_errors() {
-        let root = ModuleResolutionPathBuf::extra("foo/stdlib").unwrap();
+        let root = ModuleResolutionPathBuf::extra("foo/stdlib");
         // Must have a `.py` extension, a `.pyi` extension, or no extension:
         let bad_absolute_path = FilePath::system("foo/stdlib/x.rs");
         assert_eq!(root.relativize_path(&bad_absolute_path), None);
@@ -1023,7 +1138,6 @@ mod tests {
     fn relativize_path() {
         assert_eq!(
             ModuleResolutionPathBuf::standard_library(FilePath::system("foo/baz"))
-                .unwrap()
                 .relativize_path(&FilePath::system("foo/baz/eggs/__init__.pyi"))
                 .unwrap(),
             ModuleResolutionPathRef(ModuleResolutionPathRefInner::StandardLibrary(
@@ -1040,7 +1154,7 @@ mod tests {
             .with_custom_typeshed(typeshed)
             .with_target_version(target_version)
             .build();
-        let stdlib = ModuleResolutionPathBuf::standard_library(FilePath::System(stdlib)).unwrap();
+        let stdlib = ModuleResolutionPathBuf::standard_library(FilePath::System(stdlib));
         (db, stdlib)
     }
 

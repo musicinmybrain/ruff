@@ -2,14 +2,14 @@ use ruff_db::Upcast;
 
 use crate::resolver::{
     editable_install_resolution_paths, file_to_module, internal::ModuleNameIngredient,
-    module_resolution_settings, resolve_module_query,
+    resolve_module_query, resolve_module_resolution_settings,
 };
 use crate::typeshed::parse_typeshed_versions;
 
 #[salsa::jar(db=Db)]
 pub struct Jar(
     ModuleNameIngredient<'_>,
-    module_resolution_settings,
+    resolve_module_resolution_settings,
     editable_install_resolution_paths,
     resolve_module_query,
     file_to_module,
