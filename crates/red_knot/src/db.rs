@@ -1,18 +1,20 @@
 use std::panic::{AssertUnwindSafe, RefUnwindSafe};
 use std::sync::Arc;
 
+use rustc_hash::FxHashSet;
 use salsa::{Cancelled, Database, DbWithJar};
 
 use red_knot_module_resolver::{vendored_typeshed_stubs, Db as ResolverDb, Jar as ResolverJar};
 use red_knot_python_semantic::{Db as SemanticDb, Jar as SemanticJar};
-use ruff_db::files::{system_path_to_file, File, Files};
+use ruff_db::files::{File, Files};
 use ruff_db::program::{Program, ProgramSettings};
-use ruff_db::system::System;
+use ruff_db::system::{System, SystemPath};
 use ruff_db::vendored::VendoredFileSystem;
 use ruff_db::{Db as SourceDb, Jar as SourceJar, Upcast};
 
 use crate::lint::{lint_semantic, lint_syntax, unwind_if_cancelled, Diagnostics};
-use crate::watch::{FileChangeKind, FileWatcherChange};
+use crate::watch;
+use crate::watch::{CreatedKind, DeletedKind};
 use crate::workspace::{check_file, Package, Workspace, WorkspaceMetadata};
 
 pub trait Db: DbWithJar<Jar> + SemanticDb + Upcast<dyn SemanticDb> {}
@@ -60,44 +62,108 @@ impl RootDatabase {
     }
 
     #[tracing::instrument(level = "debug", skip(self, changes))]
-    pub fn apply_changes(&mut self, changes: Vec<FileWatcherChange>) {
+    pub fn apply_changes(&mut self, changes: Vec<watch::ChangeEvent>) {
         let workspace = self.workspace();
         let workspace_path = workspace.root(self).to_path_buf();
 
         // TODO: Optimize change tracking by only reloading a package if a file that is part of the package was changed.
-        let mut structural_change = false;
+        let mut workspace_change = false;
+        let mut changed_packages = FxHashSet::default();
+
+        // Deduplicate the `sync` calls. Many file watchers emit multiple events for the same path.
+        let mut synced_files = FxHashSet::default();
+        let mut synced_recursively = FxHashSet::default();
+
+        let mut sync_path = |db: &mut RootDatabase, path: &SystemPath| {
+            if synced_files.insert(path.to_path_buf()) {
+                File::sync_path(db, path);
+            }
+        };
+
+        let mut sync_recursively = |db: &mut RootDatabase, path: &SystemPath| {
+            if synced_recursively.insert(path.to_path_buf()) {
+                Files::sync_recursively(db, path);
+            }
+        };
+
         for change in changes {
-            if matches!(
-                change.path.file_name(),
-                Some(".gitignore" | ".ignore" | "ruff.toml" | ".ruff.toml" | "pyproject.toml")
-            ) {
-                // Changes to ignore files or settings can change the workspace structure or add/remove files
-                // from packages.
-                structural_change = true;
-            } else {
-                match change.kind {
-                    FileChangeKind::Created => {
-                        // Reload the package when a new file was added. This is necessary because the file might be excluded
-                        // by a gitignore.
-                        if workspace.package(self, &change.path).is_some() {
-                            structural_change = true;
-                        }
+            if let Some(path) = change.path() {
+                if matches!(
+                    path.file_name(),
+                    Some(".gitignore" | ".ignore" | "ruff.toml" | ".ruff.toml" | "pyproject.toml")
+                ) {
+                    // Changes to ignore files or settings can change the workspace structure or add/remove files
+                    // from packages.
+                    if let Some(package) = workspace.package(self, path) {
+                        changed_packages.insert(package);
+                    } else {
+                        workspace_change = true;
                     }
-                    FileChangeKind::Modified => {}
-                    FileChangeKind::Deleted => {
-                        if let Some(package) = workspace.package(self, &change.path) {
-                            if let Some(file) = system_path_to_file(self, &change.path) {
-                                package.remove_file(self, file);
-                            }
-                        }
-                    }
+
+                    continue;
                 }
             }
 
-            File::touch_path(self, &change.path);
+            match change {
+                watch::ChangeEvent::Changed { path, kind: _ } => sync_path(self, &path),
+
+                watch::ChangeEvent::Created { kind, path } => {
+                    match kind {
+                        CreatedKind::File => sync_path(self, &path),
+                        CreatedKind::Directory | CreatedKind::Any => {
+                            sync_recursively(self, &path);
+                        }
+                    }
+
+                    // Reload the package when a new file was added. This is necessary because the file might be excluded
+                    // by a gitignore.
+                    if let Some(package) = workspace.package(self, &path) {
+                        changed_packages.insert(package);
+                    }
+                }
+
+                watch::ChangeEvent::Deleted { kind, path } => {
+                    let is_file = match kind {
+                        DeletedKind::File => true,
+                        DeletedKind::Directory => {
+                            // file watchers emit an event for every deleted file. No need to scan the entire dir.
+                            continue;
+                        }
+                        DeletedKind::Any => self
+                            .files
+                            .try_system(self, &path)
+                            .is_some_and(|file| file.exists(self)),
+                    };
+
+                    if is_file {
+                        sync_path(self, &path);
+
+                        if let Some(package) = workspace.package(self, &path) {
+                            if let Some(file) = self.files().try_system(self, &path) {
+                                package.remove_file(self, file);
+                            }
+                        }
+                    } else {
+                        sync_recursively(self, &path);
+
+                        // TODO: Remove after converting `package.files()` to a salsa query.
+                        if let Some(package) = workspace.package(self, &path) {
+                            changed_packages.insert(package);
+                        } else {
+                            workspace_change = true;
+                        }
+                    }
+                }
+
+                watch::ChangeEvent::Rescan => {
+                    workspace_change = true;
+                    Files::sync_all(self);
+                    break;
+                }
+            }
         }
 
-        if structural_change {
+        if workspace_change {
             match WorkspaceMetadata::from_path(&workspace_path, self.system()) {
                 Ok(metadata) => {
                     tracing::debug!("Reload workspace after structural change.");
@@ -107,6 +173,10 @@ impl RootDatabase {
                 Err(error) => {
                     tracing::error!("Failed to load workspace, keep old workspace: {error}");
                 }
+            }
+        } else if !changed_packages.is_empty() {
+            for package in changed_packages {
+                package.reload_files(self);
             }
         }
     }
